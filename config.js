@@ -9,7 +9,7 @@ module.exports = {
     PAYMASTER_ADDRESS: "0xC7eA1B52D20d0B4135ae5cc8E4225b3F12eA279B",
   
     // Local private write server
-    WRITE_BASE_URL: "http://127.0.0.1:3001",
+    WRITE_BASE_URL: "http://127.0.0.1:7001",
   
     // Local sqlite file (used ONLY for repair scan)
     DB_PATH: "./trades.db",
