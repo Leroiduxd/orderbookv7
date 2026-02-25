@@ -1,0 +1,51 @@
+# =========================
+# Node.js
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# Environment / config sensible
+# =========================
+.env
+.env.*
+config.local.js
+
+# ⚠️ si ton config.js contient RPC / adresses sensibles
+# garde-le ignoré et versionne plutôt un config.example.js
+config.js
+
+# =========================
+# SQLite databases
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+
+# SQLite WAL / SHM
+*.db-wal
+*.db-shm
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# =========================
+# Temporary / generated files
+# =========================
+logs/
+tmp/
+.cache/
+
+# =========================
+# Optional: build outputs (si un jour tu en ajoutes)
+# =========================
+dist/
+build/

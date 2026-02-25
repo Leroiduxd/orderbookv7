@@ -1,0 +1,31 @@
+{
+  "name": "trade-indexer",
+  "version": "1.0.0",
+  "description": "Local trade indexer with public read API and private write API (SQLite, E6 pricing)",
+  "private": true,
+  "type": "commonjs",
+  "main": "public.read.server.js",
+  "scripts": {
+    "db": "node public.read.server.js",
+    "listener:core": "node listeners/core.tradeevent.listener.js",
+    "exec:crypto": "node executor/executor.crypto.js",
+    "exec:stock": "node executor/executor.stock.js",
+    "exec:forex": "node executor/executor.forex.js",
+    "cron:sync": "node cron/sync.cron.js",
+    "dev": "concurrently -k -n DB,CORE,CRYPTO,STOCK,FOREX,CRON -c auto \"npm run db\" \"npm run listener:core\" \"npm run exec:crypto\" \"npm run exec:stock\" \"npm run exec:forex\" \"npm run cron:sync\"",
+    "start": "npm run dev"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.0",
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
