@@ -8,8 +8,8 @@ const express = require("express");
 const { stmt } = require("./db");
 const writeRoutes = require("./write.routes");
 
-const PUBLIC_PORT = Number(process.env.PUBLIC_PORT || 3000);
-const PRIVATE_PORT = Number(process.env.PRIVATE_PORT || 3001);
+const PUBLIC_PORT = Number(process.env.PUBLIC_PORT || 7000);
+const PRIVATE_PORT = Number(process.env.PRIVATE_PORT || 7001);
 
 function normalizeAddress(addr) {
   if (typeof addr !== "string") return "";
