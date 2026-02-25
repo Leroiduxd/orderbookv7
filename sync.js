@@ -393,7 +393,7 @@ async function main() {
     process.exit(0);
   }
   
-  const writeBase = cfg.WRITE_BASE_URL || cfg.WRITE_BASE || "http://127.0.0.1:3001";
+  const writeBase = cfg.WRITE_BASE_URL || cfg.WRITE_BASE || "http://127.0.0.1:7001";
   // DB readers
   const dbRO = openDbReadOnly();
   const dbReaders = buildDbReaders(dbRO);
