@@ -16,7 +16,6 @@ config.local.js
 
 # ⚠️ si ton config.js contient RPC / adresses sensibles
 # garde-le ignoré et versionne plutôt un config.example.js
-config.js
 
 # =========================
 # SQLite databases
