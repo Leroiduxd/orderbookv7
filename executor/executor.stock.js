@@ -45,7 +45,7 @@ const RPC_URL = process.env.RPC_URL;
 const CORE_ADDRESS = process.env.CORE_ADDRESS;
 const VAULT_ADDRESS = process.env.VAULT_ADDRESS; 
 
-const READ_BASE = process.env.READ_BASE || "http://127.0.0.1:3000";
+const READ_BASE = process.env.READ_BASE || "http://127.0.0.1:7000";
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || "")
   .split(",")
