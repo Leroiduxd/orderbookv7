@@ -5,6 +5,7 @@
 // - Private WRITE server (127.0.0.1:3001) -> local only
 
 const express = require("express");
+const cors = require("cors"); // <-- AJOUT DE CORS ICI
 const { stmt } = require("./db");
 const writeRoutes = require("./write.routes");
 
@@ -38,6 +39,9 @@ function parseMarketE6(query) {
 // PUBLIC READ server
 // --------------------
 const readApp = express();
+
+// <-- AJOUT DU MIDDLEWARE CORS POUR L'API PUBLIQUE
+readApp.use(cors()); 
 
 readApp.get("/health", (req, res) => res.json({ ok: true, mode: "public-read" }));
 
@@ -132,6 +136,9 @@ readApp.listen(PUBLIC_PORT, "0.0.0.0", () => {
 // PRIVATE WRITE server (LOCAL ONLY)
 // --------------------
 const writeApp = express();
+
+// <-- AJOUT DU MIDDLEWARE CORS POUR L'API PRIVÉE
+writeApp.use(cors()); 
 writeApp.use(express.json({ limit: "1mb" }));
 
 writeApp.get("/health", (req, res) => res.json({ ok: true, mode: "private-write" }));
