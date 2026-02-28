@@ -67,6 +67,19 @@ initDb();
 const stmt = {
   getTradeById: db.prepare(`SELECT * FROM trades WHERE id = ?;`),
 
+  // --- NOUVELLES REQUÊTES ---
+  getMaxTradeId: db.prepare(`SELECT MAX(id) as maxId FROM trades;`),
+  
+  getTotalTraders: db.prepare(`SELECT COUNT(DISTINCT trader) as totalTraders FROM trades;`),
+  
+  getOpenStatsPerAssetAndDirection: db.prepare(`
+    SELECT assetId, isLong, COUNT(*) as openCount, AVG(leverage) as avgLeverage
+    FROM trades
+    WHERE state = 1
+    GROUP BY assetId, isLong;
+  `),
+  // --------------------------
+
   getTraderIdsAll: db.prepare(`
     SELECT id FROM trades
     WHERE trader = ?

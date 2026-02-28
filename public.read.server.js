@@ -48,6 +48,42 @@ readApp.use(cors());
 
 readApp.get("/health", (req, res) => res.json({ ok: true, mode: "public-read" }));
 
+// --- NOUVEAUX ENDPOINTS STATISTIQUES ---
+
+// 1. L'ID du plus grand trade
+readApp.get("/stats/max-trade-id", (req, res) => {
+  try {
+    const row = stmt.getMaxTradeId.get();
+    const maxId = row && row.maxId !== null ? row.maxId : 0;
+    res.json({ success: true, maxId });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to fetch max trade ID" });
+  }
+});
+
+// 2. Le nombre total de traders uniques
+readApp.get("/stats/total-traders", (req, res) => {
+  try {
+    const row = stmt.getTotalTraders.get();
+    const totalTraders = row ? row.totalTraders : 0;
+    res.json({ success: true, totalTraders });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to fetch total traders count" });
+  }
+});
+
+// 3. Les stats des trades ouverts (compte et levier moyen par actif et par sens)
+readApp.get("/stats/open-trades", (req, res) => {
+  try {
+    const rows = stmt.getOpenStatsPerAssetAndDirection.all();
+    res.json({ success: true, data: rows });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to fetch open trades stats" });
+  }
+});
+
+// ---------------------------------------
+
 // <-- AJOUT : NOUVEAU ENDPOINT POUR LIRE LES EXPOSITIONS
 readApp.get("/exposures", (req, res) => {
   try {
