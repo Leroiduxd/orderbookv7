@@ -9,6 +9,9 @@ const cors = require("cors"); // <-- AJOUT DE CORS ICI
 const { stmt } = require("./db");
 const writeRoutes = require("./write.routes");
 
+// <-- AJOUT : Import du service des expositions
+const { getAllExposures } = require("./services/exposures"); 
+
 const PUBLIC_PORT = Number(process.env.PUBLIC_PORT || 7000);
 const PRIVATE_PORT = Number(process.env.PRIVATE_PORT || 7001);
 
@@ -44,6 +47,20 @@ const readApp = express();
 readApp.use(cors()); 
 
 readApp.get("/health", (req, res) => res.json({ ok: true, mode: "public-read" }));
+
+// <-- AJOUT : NOUVEAU ENDPOINT POUR LIRE LES EXPOSITIONS
+readApp.get("/exposures", (req, res) => {
+  try {
+    const memory = getAllExposures();
+    res.json({
+        success: true,
+        count: Object.keys(memory).length,
+        data: memory
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to read exposures memory" });
+  }
+});
 
 // GET /trader/:address/ids?state=all|0|1|2|3
 readApp.get("/trader/:address/ids", (req, res) => {

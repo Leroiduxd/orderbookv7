@@ -5,6 +5,9 @@
 const express = require("express");
 const { stmt, tx } = require("./db");
 
+// <-- AJOUT : Import du service des expositions
+const { updateExposure } = require("./services/exposures");
+
 const router = express.Router();
 
 function normalizeAddress(addr) {
@@ -82,6 +85,10 @@ router.put("/trade/:id", (req, res) => {
     }
 
     const trade = tx.upsertTrade(payload);
+    
+    // <-- AJOUT : Met à jour l'exposition de cet actif spécifique en arrière-plan
+    updateExposure(payload.assetId).catch(err => console.error(`[Exposures] Erreur maj expo ${payload.assetId}:`, err));
+
     res.json({ ok: true, trade });
   } catch (e) {
     res.status(e.status || 400).json({ ok: false, error: e.message || "Bad request" });
@@ -175,6 +182,13 @@ router.post("/trades/batchUpsert", (req, res) => {
       });
   
       const count = runBatch(payloads);
+      
+      // <-- AJOUT : Mettre à jour l'exposition une seule fois par actif concerné dans le lot
+      const uniqueAssetIds = [...new Set(payloads.map(p => p.assetId))];
+      for (const assetId of uniqueAssetIds) {
+        updateExposure(assetId).catch(err => console.error(`[Exposures] Erreur maj expo batch ${assetId}:`, err));
+      }
+
       res.json({ ok: true, upserted: count });
     } catch (e) {
       res.status(e.status || 400).json({ ok: false, error: e.message || "Bad request" });
