@@ -8,6 +8,7 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const fs = require("fs");
+const { ethers } = require("ethers");
 
 const { stmt } = require("./db");
 const writeRoutes = require("./write.routes");
@@ -19,6 +20,20 @@ const { initBaseSpreads, getAllBaseSpreads } = require("./services/spread.servic
 const PUBLIC_PORT = Number(process.env.PUBLIC_PORT || 7000);
 const PRIVATE_PORT = Number(process.env.PRIVATE_PORT || 7001);
 
+const RPC_URL = process.env.RPC_URL;
+const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// On extrait les adresses publiques une seule fois au démarrage
+const executorWallets = PRIVATE_KEYS.map(pk => {
+  try {
+    return new ethers.Wallet(pk).address;
+  } catch (e) {
+    return null;
+  }
+}).filter(Boolean);
 
 function normalizeAddress(addr) {
   if (typeof addr !== "string") return "";
@@ -580,6 +595,43 @@ readApp.get("/spreads/base", (req, res) => {
     res.json({ success: true, data });
   } catch (e) {
     res.status(500).json({ error: "Failed to fetch base spreads" });
+  }
+});
+
+// GET /executor/wallets
+// Récupère les adresses publiques des bots d'exécution et leur solde en ETH
+readApp.get("/executor/wallets", async (req, res) => {
+  try {
+    if (!RPC_URL || executorWallets.length === 0) {
+      return res.status(400).json({ error: "RPC_URL or PRIVATE_KEYS missing in .env" });
+    }
+
+    // On se connecte à la blockchain
+    const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+
+    // On récupère le solde de chaque wallet en parallèle
+    const walletsInfo = await Promise.all(
+      executorWallets.map(async (address) => {
+        try {
+          const balanceWei = await provider.getBalance(address);
+          return {
+            address: address,
+            balanceEth: ethers.utils.formatEther(balanceWei) // Convertit les Wei en ETH lisible
+          };
+        } catch (err) {
+          return { address, balanceEth: "Error fetching balance" };
+        }
+      })
+    );
+
+    res.json({ 
+      success: true, 
+      count: walletsInfo.length,
+      data: walletsInfo 
+    });
+  } catch (e) {
+    console.error("Erreur fetching balances:", e);
+    res.status(500).json({ error: "Failed to fetch wallets info" });
   }
 });
 
