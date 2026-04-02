@@ -1,11 +1,8 @@
 #!/usr/bin/env node
 /**
  * executor.multi.js
- * - Subscribe Supra WS to all PAIRS
- * - For each tick: call /match/entry, /match/exits, and /match/liquidations
- * - Group tasks into BATCHES (Max 50 items or 500ms time-window)
- * - Execute via BrokexBatcher contract with a SINGLE aggregated Supra proof
- * - Intelligent Execution Queue with deduplication
+ * - 1 BATCH = 1 ASSET UNIQUE (Préserve le backend Supra)
+ * - Verrouillage strict des Wallets (Wait Mined + 3s de cooldown)
  */
 
 require("dotenv").config();
@@ -22,7 +19,7 @@ const path = require("path");
 // --------------------
 const CORE_ADDRESS = process.env.CORE_ADDRESS;
 const VAULT_ADDRESS = process.env.VAULT_ADDRESS; 
-const BATCHER_ADDRESS = "0x7e5215cfBF83C5B7737425cC79f072a266e5028B"; // TON BATCHER
+const BATCHER_ADDRESS = "0x7e5215cfBF83C5B7737425cC79f072a266e5028B";
 
 const VAULT_ABI = [
   {
@@ -49,7 +46,39 @@ const BATCHER_ABI = [
 ];
 
 const { createProofFetcher } = require("./proofClient");
-const { WalletPool } = require("./walletPool");
+
+// --------------------
+// WALLET POOL STRICT (Wait Mined + Cooldown)
+// --------------------
+class StrictWalletPool {
+  constructor(provider, privateKeys, cooldownMs) {
+    this.cooldownMs = cooldownMs;
+    this.wallets = privateKeys.map(pk => ({
+      instance: new ethers.Wallet(pk, provider),
+      isBusy: false,
+      availableAt: 0
+    }));
+  }
+
+  async acquire() {
+    while (true) {
+      const now = Date.now();
+      for (const w of this.wallets) {
+        if (!w.isBusy && now >= w.availableAt) {
+          w.isBusy = true; // VERROUILLAGE
+          return w; 
+        }
+      }
+      // Attend 100ms avant de revérifier si un wallet est libre
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
+  release(walletWrapper) {
+    walletWrapper.availableAt = Date.now() + this.cooldownMs;
+    walletWrapper.isBusy = false; // DÉVERROUILLAGE
+  }
+}
 
 // --------------------
 // CONFIG
@@ -185,11 +214,11 @@ function pickMarketFromTick(tick) {
 }
 
 // --------------------
-// INTELLIGENT BATCH QUEUE
+// INTELLIGENT BATCH QUEUE (1 ASSET PER BATCH)
 // --------------------
 class BatchExecutionQueue {
   constructor(walletPool, fetchProof, resyncBatcher, getLpFreeCapitalE6, getTradeLockedE6) {
-    this.pendingTasks = []; // Panier actuel
+    this.pendingTasksByAsset = {}; // Trie les tâches par AssetId
     this.executedTradeIds = new Map(); 
 
     this.walletPool = walletPool;
@@ -200,17 +229,15 @@ class BatchExecutionQueue {
 
     this.batchTimer = null;
     this.MAX_BATCH_SIZE = 50; 
-    this.FLUSH_TIMEOUT_MS = 500; // 500ms d'attente max pour fusionner les ticks
+    this.FLUSH_TIMEOUT_MS = 500; 
   }
 
   async enqueue(task) {
     const { kind, tradeId, assetId } = task;
 
-    // 1. Anti-spam: Ignore si déjà exécuté récemment
     if (this.executedTradeIds.has(tradeId)) return;
 
     try {
-      // 2. Vérifications de capital pour les "entry"
       if (kind === "entry") {
         const locked = await this.getTradeLockedE6(tradeId);
         if (locked <= 0n) {
@@ -222,16 +249,19 @@ class BatchExecutionQueue {
         if (free < locked) return; 
       }
 
-      // 3. On l'ajoute au panier et on le marque comme traité pour éviter les doublons instantanés
       this.executedTradeIds.set(tradeId, Date.now());
-      this.pendingTasks.push(task);
 
-      // 4. Logique de déclenchement du Batch
-      if (this.pendingTasks.length >= this.MAX_BATCH_SIZE) {
-        this.flushBatch(); // Panier plein (50) -> Envoi immédiat !
+      // Initialise le tableau pour cet actif s'il n'existe pas
+      if (!this.pendingTasksByAsset[assetId]) {
+        this.pendingTasksByAsset[assetId] = [];
+      }
+      this.pendingTasksByAsset[assetId].push(task);
+
+      // Si le panier d'un actif atteint 50, on envoie SEULEMENT cet actif
+      if (this.pendingTasksByAsset[assetId].length >= this.MAX_BATCH_SIZE) {
+        this.flushAsset(assetId); 
       } else if (!this.batchTimer) {
-        // Premier objet dans le panier : on lance le chrono de 500ms
-        this.batchTimer = setTimeout(() => this.flushBatch(), this.FLUSH_TIMEOUT_MS);
+        this.batchTimer = setTimeout(() => this.flushAll(), this.FLUSH_TIMEOUT_MS);
       }
 
     } catch (err) {
@@ -240,28 +270,34 @@ class BatchExecutionQueue {
     }
   }
 
-  async flushBatch() {
-    // Nettoyer le chrono
-    if (this.batchTimer) {
-      clearTimeout(this.batchTimer);
-      this.batchTimer = null;
+  // Lancé par le Timer : On vide tous les paniers un par un
+  async flushAll() {
+    this.batchTimer = null;
+    for (const assetId of Object.keys(this.pendingTasksByAsset)) {
+      if (this.pendingTasksByAsset[assetId] && this.pendingTasksByAsset[assetId].length > 0) {
+        this.flushAsset(Number(assetId));
+      }
     }
+  }
 
-    if (this.pendingTasks.length === 0) return;
-
-    // Isoler le batch actuel (jusqu'à 50) et vider la queue pour les prochains ticks
-    const batch = this.pendingTasks.splice(0, this.MAX_BATCH_SIZE);
+  // Envoie les tâches pour UN SEUL actif
+  async flushAsset(assetId) {
+    const batch = this.pendingTasksByAsset[assetId].splice(0, this.MAX_BATCH_SIZE);
+    if (batch.length === 0) return;
 
     try {
-      // Extraire TOUS les assetIds uniques de ce lot pour la preuve Supra
-      const uniqueAssetIds = [...new Set(batch.map(t => t.assetId))];
+      console.log(`[BATCH PREPARE] Grouping ${batch.length} actions for Asset ${assetId}...`);
       
-      console.log(`[BATCH PREPARE] Grouping ${batch.length} actions across ${uniqueAssetIds.length} assets...`);
-      
-      // Fetch 1 seule preuve Supra pour tout le monde
-      const proof = await this.fetchProof(uniqueAssetIds);
+      let proof;
+      try {
+        // Demande une preuve pour 1 SEUL actif (Très rapide pour Supra)
+        proof = await this.fetchProof([assetId]);
+      } catch (supraErr) {
+        console.error(`[SUPRA API DOWN] Skipped batch for Asset ${assetId}.`);
+        for (const task of batch) this.executedTradeIds.delete(task.tradeId); 
+        return; 
+      }
 
-      // Préparer les données pour le contrat Batcher
       const actions = [];
       const tradeIds = [];
 
@@ -272,42 +308,49 @@ class BatchExecutionQueue {
         else if (task.kind === "exit") actions.push(2);
       }
 
-      // Attente intelligente d'un wallet
-      const wallet = await this.walletPool.acquire();
+      // Attente intelligente d'un wallet LIBRE
+      const walletWrapper = await this.walletPool.acquire();
 
-      this.executeOnChain(actions, tradeIds, proof, wallet, batch).catch(e => {
-        console.error(`[BATCH EXEC ERR]`, e.reason || e.message);
-        // Si échec global, on supprime de l'historique et on force la synchro
-        for (const task of batch) {
-          this.resyncBatcher.enqueue(task.tradeId);
-          this.executedTradeIds.delete(task.tradeId); 
-        }
-      });
+      // On lance la transaction en arrière-plan
+      this.executeOnChain(actions, tradeIds, proof, walletWrapper, batch);
 
     } catch (err) {
       console.error("[BATCH FLUSH ERR]", err);
     }
     
-    // Nettoyage de la RAM pour les vieux trades
     this.cleanUpMemory();
   }
 
-  async executeOnChain(actions, tradeIds, proof, wallet, batchData) {
-    const batcherContract = new ethers.Contract(BATCHER_ADDRESS, BATCHER_ABI, wallet);
+  async executeOnChain(actions, tradeIds, proof, walletWrapper, batchData) {
+    try {
+      const batcherContract = new ethers.Contract(BATCHER_ADDRESS, BATCHER_ABI, walletWrapper.instance);
 
-    console.log(`[BATCH TX SENT] Sending ${actions.length} ops via ${wallet.address}...`);
-    
-    // Appel de la fonction executeBatch du Smart Contract
-    const tx = await batcherContract.executeBatch(actions, tradeIds, proof);
-    await tx.wait(1);
+      console.log(`[BATCH TX SENT] Sending ${actions.length} ops via ${walletWrapper.instance.address}...`);
+      
+      const txParams = { gasLimit: 8000000 };
+      const tx = await batcherContract.executeBatch(actions, tradeIds, proof, txParams);
+      
+      // ON ATTEND QUE LA TRANSACTION SOIT MINÉE DANS LE BLOC
+      await tx.wait(1);
 
-    console.log(`[BATCH TX MINED] ${actions.length} ops processed! Hash: ${tx.hash}`);
+      console.log(`[BATCH TX MINED] ${actions.length} ops via ${walletWrapper.instance.address} !`);
+
+    } catch (e) {
+      console.error(`[BATCH EXEC ERR]`, e.reason || e.message);
+      for (const task of batchData) {
+        this.resyncBatcher.enqueue(task.tradeId);
+        this.executedTradeIds.delete(task.tradeId); 
+      }
+    } finally {
+      // DÉVERROUILLAGE DU WALLET (Il sera disponible dans 3 secondes)
+      this.walletPool.release(walletWrapper);
+    }
   }
 
   cleanUpMemory() {
     const now = Date.now();
     for (const [id, ts] of this.executedTradeIds.entries()) {
-      if (now - ts > 120_000) { // Nettoyage après 2 minutes
+      if (now - ts > 120_000) { 
         this.executedTradeIds.delete(id);
       }
     }
@@ -328,44 +371,27 @@ async function main() {
   const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
   const vault = new ethers.Contract(VAULT_ADDRESS, VAULT_ABI, provider);
 
-  const walletPool = new WalletPool({
-    provider,
-    privateKeys: PRIVATE_KEYS,
-    perWalletDelayMs: 3000, 
-  });
+  // Instanciation de notre nouvelle Pool stricte (3000ms = 3 secondes)
+  const walletPool = new StrictWalletPool(provider, PRIVATE_KEYS, 3000);
 
   const fetchProof = createProofFetcher({ doraRpc: DORA_RPC, chainType: DORA_CHAIN });
   const resyncBatcher = createResyncBatcher();
 
+  // Cache anti-spam pour le RPC
   let lpFreeCache = { ts: 0, valueE6: 0n, fetchPromise: null };
-  
   async function getLpFreeCapitalE6() {
     const now = Date.now();
-    
-    // 1. Si le cache est valide, on retourne la valeur immédiatement
-    if (now - lpFreeCache.ts < LP_FREE_TTL_MS && lpFreeCache.valueE6 > 0n) {
-      return lpFreeCache.valueE6;
-    }
+    if (now - lpFreeCache.ts < LP_FREE_TTL_MS && lpFreeCache.valueE6 > 0n) return lpFreeCache.valueE6;
+    if (lpFreeCache.fetchPromise) return await lpFreeCache.fetchPromise;
 
-    // 2. Si une requête réseau est DÉJÀ en cours, on ne spamme pas le RPC !
-    // On attend simplement que la requête existante se termine.
-    if (lpFreeCache.fetchPromise) {
-      return await lpFreeCache.fetchPromise;
-    }
-
-    // 3. Sinon, on est le premier. On lance la requête et on la stocke
-    // pour que les autres puissent l'attendre.
     lpFreeCache.fetchPromise = vault.lpFreeCapital().then(v => {
       const bi = BigInt(v.toString());
-      // On met à jour le cache et on libère le verrou
       lpFreeCache = { ts: Date.now(), valueE6: bi, fetchPromise: null };
       return bi;
     }).catch(err => {
-      // En cas d'erreur du RPC, on libère le verrou pour pouvoir réessayer
       lpFreeCache.fetchPromise = null;
       throw err;
     });
-
     return await lpFreeCache.fetchPromise;
   }
 
@@ -379,7 +405,6 @@ async function main() {
     return locked;
   }
 
-  // Initialisation de la NOUVELLE file d'attente BATCH
   const execQueue = new BatchExecutionQueue(
     walletPool, fetchProof, resyncBatcher, getLpFreeCapitalE6, getTradeLockedE6
   );
@@ -432,9 +457,6 @@ async function main() {
         const marketE6 = decimalToE6(marketRaw);
         if (marketE6 === null) continue;
 
-        // Optionnel: Décommente la ligne suivante si tu veux voir tous les ticks (ça spam beaucoup)
-        // console.log(`[TICK] ${pair.toUpperCase()} : ${marketRaw} (AssetID: ${assetId})`);
-
         try {
           const entry = await httpGetJson(`${READ_BASE}/match/entry?assetId=${assetId}&market=${marketE6}&unit=e6`);
           const exits = await httpGetJson(`${READ_BASE}/match/exits?assetId=${assetId}&market=${marketE6}&unit=e6`);
@@ -444,7 +466,6 @@ async function main() {
           const exitIds = [...(exits.stopLoss || []), ...(exits.takeProfit || [])];
           const liqIds = liqs.liquidations || [];
 
-          // Envoi dans le panier. Le panier s'occupe de grouper les appels !
           for (const id of entryIds) execQueue.enqueue({ kind: "entry", tradeId: id, assetId });
           for (const id of exitIds) execQueue.enqueue({ kind: "exit", tradeId: id, assetId });
           for (const id of liqIds) execQueue.enqueue({ kind: "liquidation", tradeId: id, assetId });
