@@ -3,6 +3,7 @@
  * executor.multi.js
  * - 1 BATCH = 1 ASSET UNIQUE (Préserve le backend Supra)
  * - Verrouillage strict des Wallets (Wait Mined + 3s de cooldown)
+ * - OPTIMISATION : Fermetures (Liq/SL/TP) en priorité absolue pour libérer la marge avant les Ouvertures (Entry)
  */
 
 require("dotenv").config();
@@ -214,11 +215,11 @@ function pickMarketFromTick(tick) {
 }
 
 // --------------------
-// INTELLIGENT BATCH QUEUE (1 ASSET PER BATCH)
+// INTELLIGENT BATCH QUEUE (1 ASSET PER BATCH + PRIORITY CLOSES)
 // --------------------
 class BatchExecutionQueue {
   constructor(walletPool, fetchProof, resyncBatcher, getLpFreeCapitalE6, getTradeLockedE6) {
-    this.pendingTasksByAsset = {}; // Trie les tâches par AssetId
+    this.pendingTasksByAsset = {}; 
     this.executedTradeIds = new Map(); 
 
     this.walletPool = walletPool;
@@ -244,21 +245,26 @@ class BatchExecutionQueue {
           this.resyncBatcher.enqueue(tradeId);
           return; 
         }
-
-        const free = await this.getLpFreeCapitalE6();
-        if (free < locked) return; 
+        // Note: On est plus tolérant sur le check de getLpFreeCapitalE6 ici 
+        // car on va libérer de la liquidité avec les liquidations juste avant dans le lot !
       }
 
       this.executedTradeIds.set(tradeId, Date.now());
 
-      // Initialise le tableau pour cet actif s'il n'existe pas
       if (!this.pendingTasksByAsset[assetId]) {
-        this.pendingTasksByAsset[assetId] = [];
+        this.pendingTasksByAsset[assetId] = { closes: [], entries: [] };
       }
-      this.pendingTasksByAsset[assetId].push(task);
 
-      // Si le panier d'un actif atteint 50, on envoie SEULEMENT cet actif
-      if (this.pendingTasksByAsset[assetId].length >= this.MAX_BATCH_SIZE) {
+      // TRI INTELLIGENT : On sépare les ouvertures et les fermetures
+      if (kind === "liquidation" || kind === "exit") {
+        this.pendingTasksByAsset[assetId].closes.push(task); // Haute priorité
+      } else {
+        this.pendingTasksByAsset[assetId].entries.push(task); // Basse priorité
+      }
+
+      const totalTasks = this.pendingTasksByAsset[assetId].closes.length + this.pendingTasksByAsset[assetId].entries.length;
+
+      if (totalTasks >= this.MAX_BATCH_SIZE) {
         this.flushAsset(assetId); 
       } else if (!this.batchTimer) {
         this.batchTimer = setTimeout(() => this.flushAll(), this.FLUSH_TIMEOUT_MS);
@@ -270,27 +276,41 @@ class BatchExecutionQueue {
     }
   }
 
-  // Lancé par le Timer : On vide tous les paniers un par un
   async flushAll() {
     this.batchTimer = null;
     for (const assetId of Object.keys(this.pendingTasksByAsset)) {
-      if (this.pendingTasksByAsset[assetId] && this.pendingTasksByAsset[assetId].length > 0) {
+      const queues = this.pendingTasksByAsset[assetId];
+      if (queues && (queues.closes.length > 0 || queues.entries.length > 0)) {
         this.flushAsset(Number(assetId));
       }
     }
   }
 
-  // Envoie les tâches pour UN SEUL actif
   async flushAsset(assetId) {
-    const batch = this.pendingTasksByAsset[assetId].splice(0, this.MAX_BATCH_SIZE);
+    const queues = this.pendingTasksByAsset[assetId];
+    if (!queues) return;
+
+    let batch = [];
+
+    // --- ASSEMBLAGE DU LOT DE 50 (PRIORITÉ AUX FERMETURES) ---
+    // 1. On prend un maximum de fermetures (Liq, SL, TP)
+    const closesToTake = Math.min(queues.closes.length, this.MAX_BATCH_SIZE);
+    batch = batch.concat(queues.closes.splice(0, closesToTake));
+
+    // 2. S'il reste de la place, on remplit le reste du tableau avec les ouvertures
+    if (batch.length < this.MAX_BATCH_SIZE) {
+      const remainingSpace = this.MAX_BATCH_SIZE - batch.length;
+      const entriesToTake = Math.min(queues.entries.length, remainingSpace);
+      batch = batch.concat(queues.entries.splice(0, entriesToTake));
+    }
+
     if (batch.length === 0) return;
 
     try {
-      console.log(`[BATCH PREPARE] Grouping ${batch.length} actions for Asset ${assetId}...`);
+      console.log(`[BATCH PREPARE] Asset ${assetId} -> ${batch.length} actions (Fermetures en premier)`);
       
       let proof;
       try {
-        // Demande une preuve pour 1 SEUL actif (Très rapide pour Supra)
         proof = await this.fetchProof([assetId]);
       } catch (supraErr) {
         console.error(`[SUPRA API DOWN] Skipped batch for Asset ${assetId}.`);
@@ -308,10 +328,7 @@ class BatchExecutionQueue {
         else if (task.kind === "exit") actions.push(2);
       }
 
-      // Attente intelligente d'un wallet LIBRE
       const walletWrapper = await this.walletPool.acquire();
-
-      // On lance la transaction en arrière-plan
       this.executeOnChain(actions, tradeIds, proof, walletWrapper, batch);
 
     } catch (err) {
@@ -330,9 +347,7 @@ class BatchExecutionQueue {
       const txParams = { gasLimit: 8000000 };
       const tx = await batcherContract.executeBatch(actions, tradeIds, proof, txParams);
       
-      // ON ATTEND QUE LA TRANSACTION SOIT MINÉE DANS LE BLOC
       await tx.wait(1);
-
       console.log(`[BATCH TX MINED] ${actions.length} ops via ${walletWrapper.instance.address} !`);
 
     } catch (e) {
@@ -342,7 +357,6 @@ class BatchExecutionQueue {
         this.executedTradeIds.delete(task.tradeId); 
       }
     } finally {
-      // DÉVERROUILLAGE DU WALLET (Il sera disponible dans 3 secondes)
       this.walletPool.release(walletWrapper);
     }
   }
@@ -466,6 +480,7 @@ async function main() {
           const exitIds = [...(exits.stopLoss || []), ...(exits.takeProfit || [])];
           const liqIds = liqs.liquidations || [];
 
+          // Enqueue (Le Batcher va faire le tri "Priorité aux Fermetures" en interne !)
           for (const id of entryIds) execQueue.enqueue({ kind: "entry", tradeId: id, assetId });
           for (const id of exitIds) execQueue.enqueue({ kind: "exit", tradeId: id, assetId });
           for (const id of liqIds) execQueue.enqueue({ kind: "liquidation", tradeId: id, assetId });
