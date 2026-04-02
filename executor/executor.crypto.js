@@ -2,9 +2,10 @@
 /**
  * executor.multi.js
  * - Subscribe Supra WS to all PAIRS
- * - For each tick: call /match/entry, /match/exits, and /match/liquidations on your public read API
- * - Execute on CORE: executeOrder / executeStopOrTakeProfit / liquidatePosition with Supra proof snapshot
- * - Intelligent Execution Queue with 60s TTL and deduplication
+ * - For each tick: call /match/entry, /match/exits, and /match/liquidations
+ * - Group tasks into BATCHES (Max 50 items or 500ms time-window)
+ * - Execute via BrokexBatcher contract with a SINGLE aggregated Supra proof
+ * - Intelligent Execution Queue with deduplication
  */
 
 require("dotenv").config();
@@ -16,7 +17,12 @@ const { ethers } = require("ethers");
 const { spawn } = require("child_process");
 const path = require("path");
 
-const CORE_ABI = require("./coreAbi");
+// --------------------
+// SMART CONTRACT ABIs & ADDRESSES
+// --------------------
+const CORE_ADDRESS = process.env.CORE_ADDRESS;
+const VAULT_ADDRESS = process.env.VAULT_ADDRESS; 
+const BATCHER_ADDRESS = "0x7e5215cfBF83C5B7737425cC79f072a266e5028B"; // TON BATCHER
 
 const VAULT_ABI = [
   {
@@ -26,6 +32,20 @@ const VAULT_ABI = [
     stateMutability: "view",
     type: "function",
   },
+];
+
+const BATCHER_ABI = [
+  {
+    "inputs": [
+      { "internalType": "uint8[]", "name": "actions", "type": "uint8[]" },
+      { "internalType": "uint256[]", "name": "tradeIds", "type": "uint256[]" },
+      { "internalType": "bytes", "name": "oracleProof", "type": "bytes" }
+    ],
+    "name": "executeBatch",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
 ];
 
 const { createProofFetcher } = require("./proofClient");
@@ -42,9 +62,6 @@ const DORA_RPC = process.env.DORA_RPC || "https://rpc-testnet-dora-2.supra.com";
 const DORA_CHAIN = process.env.DORA_CHAIN || "evm";
 
 const RPC_URL = process.env.RPC_URL;
-const CORE_ADDRESS = process.env.CORE_ADDRESS;
-const VAULT_ADDRESS = process.env.VAULT_ADDRESS; 
-
 const READ_BASE = process.env.READ_BASE || "http://127.0.0.1:7000";
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || "")
@@ -168,121 +185,123 @@ function pickMarketFromTick(tick) {
 }
 
 // --------------------
-// INTELLIGENT QUEUE
+// INTELLIGENT BATCH QUEUE
 // --------------------
-class ExecutionQueue {
+class BatchExecutionQueue {
   constructor(walletPool, fetchProof, resyncBatcher, getLpFreeCapitalE6, getTradeLockedE6) {
-    this.queue = [];
-    this.pendingTradeIds = new Set(); 
+    this.pendingTasks = []; // Panier actuel
     this.executedTradeIds = new Map(); 
 
-    this.isProcessing = false;
     this.walletPool = walletPool;
     this.fetchProof = fetchProof;
     this.resyncBatcher = resyncBatcher;
     this.getLpFreeCapitalE6 = getLpFreeCapitalE6;
     this.getTradeLockedE6 = getTradeLockedE6;
-    this.maxWaitMs = 60_000; // TTL: 60 secondes
+
+    this.batchTimer = null;
+    this.MAX_BATCH_SIZE = 50; 
+    this.FLUSH_TIMEOUT_MS = 500; // 500ms d'attente max pour fusionner les ticks
   }
 
   async enqueue(task) {
     const { kind, tradeId, assetId } = task;
 
-    // 1. Check anti-spam: Si déjà en file d'attente ou exécuté récemment, on ignore
-    if (this.pendingTradeIds.has(tradeId)) return;
-    const lastExecAt = this.executedTradeIds.get(tradeId);
-    if (lastExecAt && Date.now() - lastExecAt < 120_000) return;
-
-    // On verrouille le tradeId immédiatement
-    this.pendingTradeIds.add(tradeId);
+    // 1. Anti-spam: Ignore si déjà exécuté récemment
+    if (this.executedTradeIds.has(tradeId)) return;
 
     try {
       // 2. Vérifications de capital pour les "entry"
       if (kind === "entry") {
         const locked = await this.getTradeLockedE6(tradeId);
         if (locked <= 0n) {
-          console.log(`[SKIP] tradeId=${tradeId} locked=0 => enqueue resync`);
           this.resyncBatcher.enqueue(tradeId);
-          this.pendingTradeIds.delete(tradeId);
           return; 
         }
 
         const free = await this.getLpFreeCapitalE6();
-        if (free < locked) {
-          console.log(`[SKIP] Not enough LP free capital. tradeId=${tradeId} locked=${locked} free=${free}`);
-          this.pendingTradeIds.delete(tradeId);
-          return; 
-        }
+        if (free < locked) return; 
       }
 
-      // 3. SNAPSHOT DE LA PREUVE: On fige la preuve Supra liée à cet instant précis
-      task.proof = await this.fetchProof([assetId]);
-      task.addedAt = Date.now();
-      
-      this.queue.push(task);
-      this.processQueue(); 
+      // 3. On l'ajoute au panier et on le marque comme traité pour éviter les doublons instantanés
+      this.executedTradeIds.set(tradeId, Date.now());
+      this.pendingTasks.push(task);
+
+      // 4. Logique de déclenchement du Batch
+      if (this.pendingTasks.length >= this.MAX_BATCH_SIZE) {
+        this.flushBatch(); // Panier plein (50) -> Envoi immédiat !
+      } else if (!this.batchTimer) {
+        // Premier objet dans le panier : on lance le chrono de 500ms
+        this.batchTimer = setTimeout(() => this.flushBatch(), this.FLUSH_TIMEOUT_MS);
+      }
 
     } catch (err) {
       console.error(`[QUEUE ERR] Setup failed for tradeId=${tradeId}`, err.message);
-      this.pendingTradeIds.delete(tradeId);
+      this.executedTradeIds.delete(tradeId);
     }
   }
 
-  async processQueue() {
-    if (this.isProcessing) return;
-    this.isProcessing = true;
+  async flushBatch() {
+    // Nettoyer le chrono
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer);
+      this.batchTimer = null;
+    }
 
-    while (this.queue.length > 0) {
-      const task = this.queue.shift();
-      this.pendingTradeIds.delete(task.tradeId);
+    if (this.pendingTasks.length === 0) return;
 
-      // 4. Vérification TTL (60s). Si périmé => on jette silencieusement.
-      const waitTime = Date.now() - task.addedAt;
-      if (waitTime > this.maxWaitMs) {
-        console.log(`[DROP] Preuve périmée dans la file (${waitTime}ms) - tradeId=${task.tradeId}`);
-        continue; 
+    // Isoler le batch actuel (jusqu'à 50) et vider la queue pour les prochains ticks
+    const batch = this.pendingTasks.splice(0, this.MAX_BATCH_SIZE);
+
+    try {
+      // Extraire TOUS les assetIds uniques de ce lot pour la preuve Supra
+      const uniqueAssetIds = [...new Set(batch.map(t => t.assetId))];
+      
+      console.log(`[BATCH PREPARE] Grouping ${batch.length} actions across ${uniqueAssetIds.length} assets...`);
+      
+      // Fetch 1 seule preuve Supra pour tout le monde
+      const proof = await this.fetchProof(uniqueAssetIds);
+
+      // Préparer les données pour le contrat Batcher
+      const actions = [];
+      const tradeIds = [];
+
+      for (const task of batch) {
+        tradeIds.push(task.tradeId);
+        if (task.kind === "entry") actions.push(0);
+        else if (task.kind === "liquidation") actions.push(1);
+        else if (task.kind === "exit") actions.push(2);
       }
 
-      try {
-        // Attente intelligente d'un wallet disponible
-        const wallet = await this.walletPool.acquire();
+      // Attente intelligente d'un wallet
+      const wallet = await this.walletPool.acquire();
 
-        // On marque le trade comme "traité" pour bloquer les prochains ticks WS pendant 2 minutes
-        this.executedTradeIds.set(task.tradeId, Date.now());
-
-        // Lancement en arrière-plan
-        this.executeOnChain(task, wallet).catch(e => {
-          console.error(`[EXEC ERR] ${task.kind} tradeId=${task.tradeId}`, e.reason || e.message);
+      this.executeOnChain(actions, tradeIds, proof, wallet, batch).catch(e => {
+        console.error(`[BATCH EXEC ERR]`, e.reason || e.message);
+        // Si échec global, on supprime de l'historique et on force la synchro
+        for (const task of batch) {
           this.resyncBatcher.enqueue(task.tradeId);
-          // Si fail réseau/revert, on le supprime de l'historique pour autoriser une repasse
           this.executedTradeIds.delete(task.tradeId); 
-        });
+        }
+      });
 
-      } catch (err) {
-        console.error("[PROCESS QUEUE ERR]", err);
-      }
+    } catch (err) {
+      console.error("[BATCH FLUSH ERR]", err);
     }
-
-    this.isProcessing = false;
-    this.cleanUpMemory(); 
+    
+    // Nettoyage de la RAM pour les vieux trades
+    this.cleanUpMemory();
   }
 
-  async executeOnChain(task, wallet) {
-    const core = new ethers.Contract(CORE_ADDRESS, CORE_ABI, wallet);
-    const proof = task.proof; // Utilisation de la preuve figée
+  async executeOnChain(actions, tradeIds, proof, wallet, batchData) {
+    const batcherContract = new ethers.Contract(BATCHER_ADDRESS, BATCHER_ABI, wallet);
 
-    let tx;
-    if (task.kind === "entry") {
-      tx = await core.executeOrder(task.tradeId, proof);
-    } else if (task.kind === "exit") {
-      tx = await core.executeStopOrTakeProfit(task.tradeId, proof);
-    } else if (task.kind === "liquidation") {
-      tx = await core.liquidatePosition(task.tradeId, proof);
-    }
-
-    console.log(`[TX SENT] ${task.kind} tradeId=${task.tradeId} via ${wallet.address} | hash: ${tx.hash}`);
+    console.log(`[BATCH TX SENT] Sending ${actions.length} ops via ${wallet.address}...`);
+    
+    // Appel de la fonction executeBatch du Smart Contract
+    const tx = await batcherContract.executeBatch(actions, tradeIds, proof);
     await tx.wait(1);
-    console.log(`[TX MINED] ${task.kind} tradeId=${task.tradeId}`);
+
+    console.log(`[BATCH TX MINED] ${actions.length} ops processed! Hash: ${tx.hash}`);
   }
 
   cleanUpMemory() {
@@ -312,7 +331,7 @@ async function main() {
   const walletPool = new WalletPool({
     provider,
     privateKeys: PRIVATE_KEYS,
-    perWalletDelayMs: 3000, // 3 secondes recommandées pour éviter les soucis de nonces
+    perWalletDelayMs: 3000, 
   });
 
   const fetchProof = createProofFetcher({ doraRpc: DORA_RPC, chainType: DORA_CHAIN });
@@ -338,8 +357,8 @@ async function main() {
     return locked;
   }
 
-  // Initialisation de la file d'attente
-  const execQueue = new ExecutionQueue(
+  // Initialisation de la NOUVELLE file d'attente BATCH
+  const execQueue = new BatchExecutionQueue(
     walletPool, fetchProof, resyncBatcher, getLpFreeCapitalE6, getTradeLockedE6
   );
 
@@ -391,7 +410,8 @@ async function main() {
         const marketE6 = decimalToE6(marketRaw);
         if (marketE6 === null) continue;
 
-        console.log(`[TICK] ${pair.toUpperCase()} : ${marketRaw} (AssetID: ${assetId})`);
+        // Optionnel: Décommente la ligne suivante si tu veux voir tous les ticks (ça spam beaucoup)
+        // console.log(`[TICK] ${pair.toUpperCase()} : ${marketRaw} (AssetID: ${assetId})`);
 
         try {
           const entry = await httpGetJson(`${READ_BASE}/match/entry?assetId=${assetId}&market=${marketE6}&unit=e6`);
@@ -402,7 +422,7 @@ async function main() {
           const exitIds = [...(exits.stopLoss || []), ...(exits.takeProfit || [])];
           const liqIds = liqs.liquidations || [];
 
-          // PLUS DE AWAIT NI DE SLEEP : On balance tout dans la file
+          // Envoi dans le panier. Le panier s'occupe de grouper les appels !
           for (const id of entryIds) execQueue.enqueue({ kind: "entry", tradeId: id, assetId });
           for (const id of exitIds) execQueue.enqueue({ kind: "exit", tradeId: id, assetId });
           for (const id of liqIds) execQueue.enqueue({ kind: "liquidation", tradeId: id, assetId });
@@ -424,6 +444,7 @@ async function main() {
   }
 
   console.log("[Executor] READY");
+  console.log(" - BATCHER:", BATCHER_ADDRESS);
   console.log(" - CORE:", CORE_ADDRESS);
   console.log(" - wallets:", PRIVATE_KEYS.length);
   connectSupra();
