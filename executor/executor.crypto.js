@@ -337,14 +337,36 @@ async function main() {
   const fetchProof = createProofFetcher({ doraRpc: DORA_RPC, chainType: DORA_CHAIN });
   const resyncBatcher = createResyncBatcher();
 
-  let lpFreeCache = { ts: 0, valueE6: 0n };
+  let lpFreeCache = { ts: 0, valueE6: 0n, fetchPromise: null };
+  
   async function getLpFreeCapitalE6() {
     const now = Date.now();
-    if (now - lpFreeCache.ts < LP_FREE_TTL_MS) return lpFreeCache.valueE6;
-    const v = await vault.lpFreeCapital();
-    const bi = BigInt(v.toString());
-    lpFreeCache = { ts: now, valueE6: bi };
-    return bi;
+    
+    // 1. Si le cache est valide, on retourne la valeur immédiatement
+    if (now - lpFreeCache.ts < LP_FREE_TTL_MS && lpFreeCache.valueE6 > 0n) {
+      return lpFreeCache.valueE6;
+    }
+
+    // 2. Si une requête réseau est DÉJÀ en cours, on ne spamme pas le RPC !
+    // On attend simplement que la requête existante se termine.
+    if (lpFreeCache.fetchPromise) {
+      return await lpFreeCache.fetchPromise;
+    }
+
+    // 3. Sinon, on est le premier. On lance la requête et on la stocke
+    // pour que les autres puissent l'attendre.
+    lpFreeCache.fetchPromise = vault.lpFreeCapital().then(v => {
+      const bi = BigInt(v.toString());
+      // On met à jour le cache et on libère le verrou
+      lpFreeCache = { ts: Date.now(), valueE6: bi, fetchPromise: null };
+      return bi;
+    }).catch(err => {
+      // En cas d'erreur du RPC, on libère le verrou pour pouvoir réessayer
+      lpFreeCache.fetchPromise = null;
+      throw err;
+    });
+
+    return await lpFreeCache.fetchPromise;
   }
 
   const lockedCache = new Map();
